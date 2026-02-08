@@ -1,0 +1,650 @@
+#!/usr/bin/env bash
+# autopilot.sh — Deterministic shell-based orchestrator for the Spec Kit lifecycle.
+#
+# Replaces the unreliable single-session /autopilot Claude Code command with a
+# bash state machine. Each phase gets a fresh `claude -p` invocation with full
+# context window. Loops across epics automatically.
+#
+# Usage:
+#   ./autopilot.sh [epic-number] [--no-auto-continue] [--dry-run]
+#
+# Examples:
+#   ./autopilot.sh              # Auto-detect next epic, live dashboard
+#   ./autopilot.sh 003          # Start/resume epic 003
+#   ./autopilot.sh --silent     # Suppress live dashboard output
+#   ./autopilot.sh --no-auto-continue   # Pause between epics
+
+set -euo pipefail
+
+SCRIPT_DIR="$(CDPATH="" cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/autopilot-lib.sh"
+source "$SCRIPT_DIR/autopilot-stream.sh"
+source "$SCRIPT_DIR/autopilot-prompts.sh"
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+
+OPUS="opus"
+SONNET="sonnet"
+
+# Phase → model mapping
+declare -A PHASE_MODEL=(
+    [specify]="$OPUS"
+    [clarify]="$OPUS"
+    [clarify-verify]="$OPUS"
+    [plan]="$OPUS"
+    [tasks]="$OPUS"
+    [analyze]="$OPUS"
+    [analyze-verify]="$OPUS"
+    [implement]="$SONNET"
+    [review]="$OPUS"
+    [crystallize]="$OPUS"
+    [finalize-fix]="$OPUS"
+    [finalize-review]="$OPUS"
+)
+
+# Phase → allowed tools
+declare -A PHASE_TOOLS=(
+    [specify]="Skill,Read,Write,Edit,Bash,Glob,Grep,TodoWrite"
+    [clarify]="Skill,Read,Write,Edit,Bash,Glob,Grep"
+    [clarify-verify]="Read,Write,Edit,Bash,Glob,Grep"
+    [plan]="Skill,Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch"
+    [tasks]="Skill,Read,Write,Edit,Glob,Grep"
+    [analyze]="Skill,Read,Write,Edit,Bash,Glob,Grep"
+    [analyze-verify]="Skill,Read,Write,Edit,Bash,Glob,Grep"
+    [implement]="Skill,Task,Read,Write,Edit,Bash,Glob,Grep,TodoWrite"
+    [review]="Read,Write,Edit,Bash,Glob,Grep"
+    [crystallize]="Read,Write,Edit,Bash,Glob,Grep"
+    [finalize-fix]="Read,Write,Edit,Bash,Glob,Grep"
+    [finalize-review]="Read,Write,Edit,Bash,Glob,Grep"
+)
+
+# Phase → max retries (convergence phases get more attempts)
+declare -A PHASE_MAX_RETRIES=(
+    [specify]=3
+    [clarify]=5
+    [clarify-verify]=2
+    [plan]=3
+    [tasks]=3
+    [analyze]=5
+    [analyze-verify]=5
+    [implement]=3
+    [review]=3
+    [crystallize]=1
+    [finalize-fix]=3
+    [finalize-review]=1
+)
+
+# ─── Argument Parsing ────────────────────────────────────────────────────────
+
+TARGET_EPIC=""
+AUTO_CONTINUE=true
+DRY_RUN=false
+SILENT=false
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-auto-continue) AUTO_CONTINUE=false ;;
+            --dry-run)          DRY_RUN=true ;;
+            --silent)           SILENT=true ;;
+            --help|-h)
+                echo "Usage: autopilot.sh [epic-number] [--no-auto-continue] [--dry-run] [--silent]"
+                echo ""
+                echo "Options:"
+                echo "  epic-number          Target a specific epic (e.g., 003)"
+                echo "  --no-auto-continue   Pause between epics instead of auto-continuing"
+                echo "  --dry-run            Show what would happen without invoking claude"
+                echo "  --silent             Suppress live dashboard output (files still written)"
+                exit 0
+                ;;
+            [0-9][0-9][0-9])    TARGET_EPIC="$1" ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+# ─── Claude Invocation ───────────────────────────────────────────────────────
+
+# Invoke claude -p with the given prompt, model, and allowed tools.
+# Uses --output-format stream-json --verbose for structured observability.
+# Returns: claude's exit code.
+invoke_claude() {
+    local phase="$1"
+    local prompt="$2"
+    local epic_num="$3"
+    local title="${4:-}"
+    local model="${PHASE_MODEL[$phase]}"
+    local tools="${PHASE_TOOLS[$phase]}"
+
+    log PHASE "Running phase: $phase (model=$model)"
+
+    if $DRY_RUN; then
+        log INFO "[DRY RUN] Would invoke claude -p with model=$model, tools=$tools"
+        log INFO "[DRY RUN] Prompt (first 200 chars): ${prompt:0:200}..."
+        return 0
+    fi
+
+    # Print live dashboard header
+    _print_dashboard_header "$epic_num" "$title" "$phase" "$model"
+
+    # Export REPO_ROOT for process_stream; SILENT and PHASE_MODEL are already global
+    export REPO_ROOT
+
+    local exit_code=0
+    claude -p "$prompt" \
+        --model "$model" \
+        --allowedTools "$tools" \
+        --output-format stream-json \
+        --verbose \
+        --dangerously-skip-permissions \
+        2>&1 | process_stream "$epic_num" "$phase" || exit_code=$?
+
+    return "$exit_code"
+}
+
+# ─── Phase Dispatch ──────────────────────────────────────────────────────────
+
+# Run a single phase. Returns 0 on success, 1 on failure.
+run_phase() {
+    local phase="$1"
+    local epic_num="$2"
+    local short_name="$3"
+    local title="$4"
+    local epic_file="$5"
+    local repo_root="$6"
+    local spec_dir="$repo_root/specs/$short_name"
+
+    local prompt=""
+
+    case "$phase" in
+        specify)
+            prompt="$(prompt_specify "$epic_num" "$title" "$epic_file" "$repo_root")"
+            ;;
+        clarify)
+            prompt="$(prompt_clarify "$epic_num" "$title" "$epic_file" "$repo_root" "$spec_dir")"
+            ;;
+        clarify-verify)
+            prompt="$(prompt_clarify_verify "$epic_num" "$title" "$repo_root" "$spec_dir")"
+            ;;
+        plan)
+            prompt="$(prompt_plan "$epic_num" "$title" "$repo_root")"
+            ;;
+        tasks)
+            prompt="$(prompt_tasks "$epic_num" "$title" "$repo_root")"
+            ;;
+        analyze)
+            prompt="$(prompt_analyze "$epic_num" "$title" "$repo_root" "$spec_dir")"
+            ;;
+        analyze-verify)
+            prompt="$(prompt_analyze_verify "$epic_num" "$title" "$repo_root" "$spec_dir")"
+            ;;
+        implement)
+            prompt="$(prompt_implement "$epic_num" "$title" "$repo_root" "$spec_dir")"
+            ;;
+        review)
+            prompt="$(prompt_review "$epic_num" "$title" "$repo_root" "$short_name")"
+            ;;
+        crystallize)
+            prompt="$(prompt_crystallize "$epic_num" "$title" "$repo_root" "$short_name")"
+            ;;
+        *)
+            log ERROR "Unknown phase: $phase"
+            return 1
+            ;;
+    esac
+
+    invoke_claude "$phase" "$prompt" "$epic_num" "$title"
+}
+
+# ─── Merge ───────────────────────────────────────────────────────────────────
+
+do_merge() {
+    local repo_root="$1"
+    local epic_num="$2"
+    local short_name="$3"
+    local title="$4"
+    local epic_file="${5:-}"
+
+    echo ""
+    echo -e "${BOLD}════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${GREEN}${BOLD}  Epic $epic_num: $title — READY TO MERGE${RESET}"
+    echo -e "${BOLD}════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+
+    # Show summary
+    local files_changed
+    files_changed=$(git -C "$repo_root" diff --name-only "$BASE_BRANCH"..HEAD | wc -l)
+    echo -e "  Files changed: ${BOLD}$files_changed${RESET}"
+
+    if [[ -n "$PROJECT_TEST_CMD" ]]; then
+        local test_output
+        test_output=$(cd "$repo_root/$PROJECT_WORK_DIR" && eval "$PROJECT_TEST_CMD" 2>&1 | tail -1 || true)
+        echo -e "  Tests: ${BOLD}$test_output${RESET}"
+    fi
+
+    echo ""
+
+    # If running non-interactively (no TTY on stdin), auto-merge
+    if [[ ! -t 0 ]]; then
+        log INFO "Non-interactive mode — auto-merging $short_name to $BASE_BRANCH"
+    else
+        echo -n "Merge $short_name to $BASE_BRANCH? [Y/n] "
+        read -r confirm
+        if [[ "$confirm" =~ ^[Nn] ]]; then
+            log WARN "Merge declined by user"
+            return 1
+        fi
+    fi
+
+    # Ensure working tree is clean before switching branches
+    if ! git -C "$repo_root" diff --quiet 2>/dev/null || \
+       ! git -C "$repo_root" diff --cached --quiet 2>/dev/null; then
+        log WARN "Uncommitted changes — committing before merge"
+        git -C "$repo_root" add -A
+        git -C "$repo_root" commit -m "chore(${epic_num}): commit remaining changes before merge"
+    fi
+
+    log INFO "Merging $short_name to $BASE_BRANCH"
+    git -C "$repo_root" checkout "$BASE_BRANCH" || {
+        log ERROR "Failed to checkout $BASE_BRANCH"
+        return 1
+    }
+
+    # Verify we actually switched
+    local current_branch
+    current_branch=$(git -C "$repo_root" branch --show-current)
+    if [[ "$current_branch" != "$BASE_BRANCH" ]]; then
+        log ERROR "Still on $current_branch after checkout — aborting merge"
+        return 1
+    fi
+
+    git -C "$repo_root" merge "$short_name" --no-ff \
+        -m "merge: $short_name — $title" || {
+        log ERROR "Merge failed for $short_name"
+        return 1
+    }
+    log OK "Merged $short_name to $BASE_BRANCH"
+
+    # Auto-update epic YAML frontmatter
+    if [[ -n "$epic_file" ]] && [[ -f "$epic_file" ]]; then
+        mark_epic_merged "$epic_file" "$short_name"
+        git -C "$repo_root" add "$epic_file"
+        git -C "$repo_root" commit -m "fix($epic_num): mark epic YAML as merged"
+    fi
+
+    return 0
+}
+
+# ─── Cost Accumulation ──────────────────────────────────────────────────
+
+# Read latest phase cost from status file and add to epic_total_cost.
+# epic_total_cost is a local in run_epic() — uses nameref-style accumulation.
+_accumulate_phase_cost() {
+    local repo_root="$1"
+    local status_file="$repo_root/.specify/logs/autopilot-status.json"
+    if [[ -f "$status_file" ]]; then
+        local phase_cost
+        phase_cost=$(jq -r '.cost_usd // 0' "$status_file" 2>/dev/null || echo 0)
+        epic_total_cost=$(echo "$epic_total_cost $phase_cost" | awk '{printf "%.6f", $1 + $2}')
+        log INFO "Epic cumulative cost: \$$epic_total_cost"
+    fi
+}
+
+# ─── Main Epic Loop ─────────────────────────────────────────────────────────
+
+run_epic() {
+    local repo_root="$1"
+    local epic_num="$2"
+    local short_name="$3"
+    local title="$4"
+    local epic_file="$5"
+    local epic_total_cost=0
+
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}║  Epic $epic_num: $title${RESET}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    # Ensure correct branch (skip for specify — it creates the branch)
+    local state
+    state="$(detect_state "$repo_root" "$epic_num" "$short_name")"
+
+    if [[ "$state" != "specify" ]] && [[ -n "$short_name" ]]; then
+        ensure_feature_branch "$repo_root" "$short_name"
+    fi
+
+    # Phase loop
+    while true; do
+        state="$(detect_state "$repo_root" "$epic_num" "$short_name")"
+        log INFO "Detected state: $state"
+
+        if [[ "$state" == "done" ]]; then
+            log OK "Epic $epic_num is complete and merged"
+            return 0
+        fi
+
+        if [[ "$state" == "review" ]]; then
+            # Review first, then merge
+            local retries=0
+            while [[ $retries -lt ${PHASE_MAX_RETRIES[$state]:-3} ]]; do
+                if run_phase "review" "$epic_num" "$short_name" "$title" "$epic_file" "$repo_root"; then
+                    break
+                fi
+                retries=$((retries + 1))
+                log WARN "Review attempt $retries/${PHASE_MAX_RETRIES[$state]:-3} failed, retrying..."
+            done
+
+            if [[ $retries -ge ${PHASE_MAX_RETRIES[$state]:-3} ]]; then
+                log ERROR "Review failed after ${PHASE_MAX_RETRIES[$state]:-3} attempts"
+                return 1
+            fi
+
+            # Accumulate review phase cost
+            _accumulate_phase_cost "$repo_root"
+
+            # Merge gate
+            if ! do_merge "$repo_root" "$epic_num" "$short_name" "$title" "$epic_file"; then
+                return 1
+            fi
+
+            # Post-merge crystallization — update context files on base branch
+            # Non-blocking: failure does not stop the pipeline
+            if ! run_phase "crystallize" "$epic_num" "$short_name" "$title" "$epic_file" "$repo_root"; then
+                log WARN "Crystallize phase failed — continuing (non-blocking)"
+            fi
+            _accumulate_phase_cost "$repo_root"
+
+            # Write post-epic summary
+            write_epic_summary "$repo_root" "$epic_num" "$short_name" "$title" "$epic_total_cost"
+            return 0
+        fi
+
+        # Run the phase with retry logic
+        local retries=0
+        local prev_state="$state"
+
+        while [[ $retries -lt ${PHASE_MAX_RETRIES[$state]:-3} ]]; do
+            if run_phase "$state" "$epic_num" "$short_name" "$title" "$epic_file" "$repo_root"; then
+                # After specify, we may need to refresh short_name (branch was just created)
+                if [[ "$state" == "specify" ]] && [[ -z "$short_name" ]]; then
+                    # Re-scan for the newly created spec dir.
+                    # Check epic_num prefix first, then fall back to scanning all
+                    # spec dirs for a spec.md that references this epic.
+                    local _found=false
+                    for dir in "$repo_root/specs/${epic_num}"-*; do
+                        if [[ -d "$dir" ]]; then
+                            short_name="$(basename "$dir")"
+                            _found=true
+                            break
+                        fi
+                    done
+                    # Fallback: find any spec dir whose spec.md was just created
+                    # and doesn't match an existing epic's branch field
+                    if ! $_found; then
+                        local _known_branches=""
+                        _known_branches=$(grep -h '^branch:' "$repo_root"/docs/specs/epics/epic-*.md 2>/dev/null \
+                            | sed 's/^branch: *//' | grep -v '^$' || true)
+                        for dir in "$repo_root"/specs/*/; do
+                            [[ ! -f "$dir/spec.md" ]] && continue
+                            local _dirname
+                            _dirname="$(basename "$dir")"
+                            if ! echo "$_known_branches" | grep -qx "$_dirname" 2>/dev/null; then
+                                short_name="$_dirname"
+                                _found=true
+                                break
+                            fi
+                        done
+                    fi
+                    if $_found; then
+                        log INFO "Spec dir created: $short_name"
+                        ensure_feature_branch "$repo_root" "$short_name"
+                        # Auto-update epic YAML branch field
+                        if [[ -n "$epic_file" ]] && [[ -f "$epic_file" ]]; then
+                            sed -i "s/^branch:.*/branch: $short_name/" "$epic_file"
+                            log INFO "Updated $(basename "$epic_file"): branch=$short_name"
+                        fi
+                    fi
+                fi
+
+                # Verify state advanced
+                local new_state
+                new_state="$(detect_state "$repo_root" "$epic_num" "$short_name")"
+
+                if [[ "$new_state" != "$prev_state" ]]; then
+                    _accumulate_phase_cost "$repo_root"
+                    log OK "Phase $prev_state → $new_state"
+                    break
+                else
+                    retries=$((retries + 1))
+                    # Iterative phases: log as "rounds" not "retries"
+                    if [[ "$state" == "clarify" || "$state" == "analyze" ]]; then
+                        log INFO "${state^} round $retries/${PHASE_MAX_RETRIES[$state]:-5} — observations remain, re-running in fresh context"
+                    else
+                        log WARN "State did not advance ($state), retry $retries/${PHASE_MAX_RETRIES[$state]:-3}"
+                    fi
+                fi
+            else
+                retries=$((retries + 1))
+                log WARN "Phase $state failed (exit code), retry $retries/${PHASE_MAX_RETRIES[$state]:-3}"
+            fi
+        done
+
+        if [[ $retries -ge ${PHASE_MAX_RETRIES[$state]:-3} ]]; then
+            # Iterative phases: force-advance instead of erroring
+            local spec_dir="$repo_root/specs/$short_name"
+            if [[ "$state" == "clarify" ]] && [[ -f "$spec_dir/spec.md" ]]; then
+                log WARN "Clarify: max $retries rounds reached — forcing advance to plan"
+                echo -e "\n<!-- CLARIFY_COMPLETE -->" >> "$spec_dir/spec.md"
+                git -C "$repo_root" add "$spec_dir/spec.md" && \
+                git -C "$repo_root" commit -m "chore(${epic_num}): force-advance clarify after ${retries} rounds" 2>/dev/null || true
+                _accumulate_phase_cost "$repo_root"
+                continue
+            elif [[ "$state" == "clarify-verify" ]] && [[ -f "$spec_dir/spec.md" ]]; then
+                log WARN "Clarify-verify: max $retries attempts — forcing advance to plan"
+                echo -e "\n<!-- CLARIFY_VERIFIED -->" >> "$spec_dir/spec.md"
+                git -C "$repo_root" add "$spec_dir/spec.md" && \
+                git -C "$repo_root" commit -m "chore(${epic_num}): force-advance clarify-verify after ${retries} attempts" 2>/dev/null || true
+                _accumulate_phase_cost "$repo_root"
+                continue
+            elif [[ "$state" == "analyze" ]] && [[ -f "$spec_dir/tasks.md" ]]; then
+                log WARN "Analyze: max $retries rounds reached — forcing advance to implement"
+                echo -e "\n<!-- ANALYZED -->" >> "$spec_dir/tasks.md"
+                git -C "$repo_root" add "$spec_dir/tasks.md" && \
+                git -C "$repo_root" commit -m "chore(${epic_num}): force-advance analyze after ${retries} rounds" 2>/dev/null || true
+                _accumulate_phase_cost "$repo_root"
+                continue
+            fi
+            log ERROR "Phase $state stuck after ${PHASE_MAX_RETRIES[$state]:-3} attempts. Stopping."
+            log ERROR "Resume with: ./autopilot.sh $epic_num"
+            return 1
+        fi
+    done
+}
+
+# ─── Finalize (all epics merged) ─────────────────────────────────────────────
+
+# Run finalize phase: test/lint → fix iteratively → cross-epic review → summary.
+# Called when all epics are merged. Operates on base branch.
+run_finalize() {
+    local repo_root="$1"
+
+    echo ""
+    echo -e "${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}║  FINALIZE: All Epics Merged — Integration Check        ║${RESET}"
+    echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    # Ensure we're on base branch
+    local current_branch
+    current_branch=$(git -C "$repo_root" branch --show-current)
+    if [[ "$current_branch" != "$BASE_BRANCH" ]]; then
+        log INFO "Switching to $BASE_BRANCH for finalize"
+        git -C "$repo_root" checkout "$BASE_BRANCH"
+    fi
+
+    # ── Step 1: Iterative test/lint fix loop ──
+    local max_fix_rounds=3
+    local round=0
+    local tests_ok=false
+    local lint_ok=false
+
+    while [[ $round -lt $max_fix_rounds ]]; do
+        round=$((round + 1))
+        log INFO "Finalize fix round $round/$max_fix_rounds"
+
+        # Run tests
+        if verify_tests "$repo_root"; then
+            tests_ok=true
+        else
+            tests_ok=false
+        fi
+
+        # Run lint
+        if verify_lint "$repo_root"; then
+            lint_ok=true
+        else
+            lint_ok=false
+        fi
+
+        # If both pass, break
+        if $tests_ok && $lint_ok; then
+            log OK "Tests and lint pass on $BASE_BRANCH"
+            break
+        fi
+
+        # Invoke Claude Opus to fix failures
+        log PHASE "Invoking Opus to fix test/lint failures (round $round)"
+
+        local fix_prompt
+        fix_prompt="$(prompt_finalize_fix "$repo_root" "$LAST_TEST_OUTPUT" "$LAST_LINT_OUTPUT")"
+
+        if $DRY_RUN; then
+            log INFO "[DRY RUN] Would invoke claude to fix test/lint failures"
+        else
+            invoke_claude "finalize-fix" "$fix_prompt" "FIN" "Fix test/lint failures" || {
+                log WARN "Finalize-fix invocation failed (round $round)"
+            }
+        fi
+    done
+
+    if ! $tests_ok; then
+        log ERROR "Finalize: tests still failing after $max_fix_rounds fix rounds"
+        return 1
+    fi
+
+    if ! $lint_ok; then
+        log WARN "Finalize: lint issues remain after $max_fix_rounds fix rounds (non-blocking)"
+    fi
+
+    # ── Step 2: Cross-epic integration review ──
+    log PHASE "Cross-epic integration review (Opus)"
+
+    local review_prompt
+    review_prompt="$(prompt_finalize_review "$repo_root")"
+
+    if $DRY_RUN; then
+        log INFO "[DRY RUN] Would invoke claude for cross-epic integration review"
+    else
+        invoke_claude "finalize-review" "$review_prompt" "FIN" "Cross-epic integration review" || {
+            log WARN "Finalize-review invocation failed (non-blocking)"
+        }
+
+        # Re-verify after review changes
+        if ! verify_tests "$repo_root"; then
+            log WARN "Tests broke during integration review — invoking fix"
+            local refix_prompt
+            refix_prompt="$(prompt_finalize_fix "$repo_root" "$LAST_TEST_OUTPUT" "$LAST_LINT_OUTPUT")"
+            invoke_claude "finalize-fix" "$refix_prompt" "FIN" "Post-review fix" || true
+            if ! verify_tests "$repo_root"; then
+                log ERROR "Finalize: tests fail after integration review fix attempt"
+                return 1
+            fi
+        fi
+    fi
+
+    # ── Step 3: Generate project summary ──
+    write_project_summary "$repo_root"
+
+    log OK "Finalize complete"
+    return 0
+}
+
+# ─── Entry Point ─────────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+
+    # Preflight: jq required for stream-json processing
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "ERROR: jq is required for autopilot observability. Install: sudo apt install jq" >&2
+        exit 1
+    fi
+
+    local repo_root
+    repo_root="$(get_repo_root)"
+    REPO_ROOT="$repo_root"
+    init_logging "$repo_root"
+    load_project_config "$repo_root"
+
+    # Base branch for merges (from project.env or fallback)
+    BASE_BRANCH="${BASE_BRANCH:-master}"
+
+    log INFO "Autopilot started (auto-continue=$AUTO_CONTINUE, dry-run=$DRY_RUN, silent=$SILENT)"
+    log INFO "Repository: $repo_root (base branch: $BASE_BRANCH)"
+
+    # Trap for clean exit
+    trap 'log WARN "Autopilot interrupted. Resume with: ./autopilot.sh"; exit 130' INT TERM
+
+    while true; do
+        # Find next epic
+        local epic_info
+        epic_info="$(find_next_epic "$repo_root" "$TARGET_EPIC")"
+
+        if [[ -z "$epic_info" ]]; then
+            if [[ -n "$TARGET_EPIC" ]]; then
+                log ERROR "Epic $TARGET_EPIC not found"
+            else
+                log OK "All epics complete!"
+                run_finalize "$repo_root" || log ERROR "Finalize failed"
+            fi
+            break
+        fi
+
+        # Parse epic info
+        IFS='|' read -r epic_num short_name title epic_file <<< "$epic_info"
+        log INFO "Next epic: $epic_num — $title"
+
+        # Run the epic lifecycle
+        if ! run_epic "$repo_root" "$epic_num" "$short_name" "$title" "$epic_file"; then
+            log ERROR "Epic $epic_num did not complete successfully"
+            break
+        fi
+
+        # If targeting a specific epic, stop after it
+        if [[ -n "$TARGET_EPIC" ]]; then
+            break
+        fi
+
+        # Auto-continue or pause
+        if ! $AUTO_CONTINUE; then
+            echo ""
+            echo -n "Continue to next epic? [y/N] "
+            read -r confirm
+            if [[ ! "$confirm" =~ ^[Yy] ]]; then
+                log INFO "Stopped by user between epics"
+                break
+            fi
+        else
+            log INFO "Auto-continuing to next epic..."
+        fi
+    done
+
+    log OK "Autopilot finished"
+}
+
+main "$@"
