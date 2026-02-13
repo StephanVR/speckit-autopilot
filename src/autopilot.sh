@@ -370,43 +370,41 @@ run_epic() {
 
         while [[ $retries -lt ${PHASE_MAX_RETRIES[$state]:-3} ]]; do
             if run_phase "$state" "$epic_num" "$short_name" "$title" "$epic_file" "$repo_root"; then
-                # After specify, we may need to refresh short_name (branch was just created)
-                if [[ "$state" == "specify" ]] && [[ -z "$short_name" ]]; then
-                    # Re-scan for the newly created spec dir.
-                    # Check epic_num prefix first, then fall back to scanning all
-                    # spec dirs for a spec.md that references this epic.
-                    local _found=false
-                    for dir in "$repo_root/specs/${epic_num}"-*; do
-                        if [[ -d "$dir" ]]; then
-                            short_name="$(basename "$dir")"
-                            _found=true
-                            break
-                        fi
-                    done
-                    # Fallback: find any spec dir whose spec.md was just created
-                    # and doesn't match an existing epic's branch field
-                    if ! $_found; then
-                        local _known_branches=""
-                        _known_branches=$(grep -h '^branch:' "$repo_root"/docs/specs/epics/epic-*.md 2>/dev/null \
-                            | sed 's/^branch: *//' | grep -v '^$' || true)
-                        for dir in "$repo_root"/specs/*/; do
-                            [[ ! -f "$dir/spec.md" ]] && continue
-                            local _dirname
-                            _dirname="$(basename "$dir")"
-                            if ! echo "$_known_branches" | grep -qx "$_dirname" 2>/dev/null; then
-                                short_name="$_dirname"
-                                _found=true
-                                break
-                            fi
-                        done
-                    fi
-                    if $_found; then
-                        log INFO "Spec dir created: $short_name"
-                        ensure_feature_branch "$repo_root" "$short_name"
-                        # Auto-update epic YAML branch field
+                # After specify, refresh short_name from actual git branch.
+                # create-new-feature.sh may use a different prefix (e.g. 036-)
+                # than the epic number (e.g. 012-), causing a mismatch.
+                if [[ "$state" == "specify" ]]; then
+                    local actual_branch
+                    actual_branch=$(git -C "$repo_root" branch --show-current 2>/dev/null || echo "")
+                    if [[ -n "$actual_branch" ]] && [[ "$actual_branch" != "$BASE_BRANCH" ]] && [[ "$actual_branch" != "$short_name" ]]; then
+                        log INFO "Branch mismatch: YAML=$short_name, actual=$actual_branch — correcting"
+                        short_name="$actual_branch"
                         if [[ -n "$epic_file" ]] && [[ -f "$epic_file" ]]; then
                             sed -i "s/^branch:.*/branch: $short_name/" "$epic_file"
                             log INFO "Updated $(basename "$epic_file"): branch=$short_name"
+                        fi
+                    elif [[ -z "$short_name" ]]; then
+                        # No branch in YAML — scan for newly created spec dir
+                        local _found=false
+                        if [[ -n "$actual_branch" ]] && [[ "$actual_branch" != "$BASE_BRANCH" ]]; then
+                            short_name="$actual_branch"
+                            _found=true
+                        else
+                            for dir in "$repo_root/specs/${epic_num}"-*; do
+                                if [[ -d "$dir" ]]; then
+                                    short_name="$(basename "$dir")"
+                                    _found=true
+                                    break
+                                fi
+                            done
+                        fi
+                        if $_found || [[ -n "$short_name" ]]; then
+                            log INFO "Spec dir created: $short_name"
+                            ensure_feature_branch "$repo_root" "$short_name"
+                            if [[ -n "$epic_file" ]] && [[ -f "$epic_file" ]]; then
+                                sed -i "s/^branch:.*/branch: $short_name/" "$epic_file"
+                                log INFO "Updated $(basename "$epic_file"): branch=$short_name"
+                            fi
                         fi
                     fi
                 fi
