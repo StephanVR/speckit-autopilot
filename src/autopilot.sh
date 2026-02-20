@@ -42,7 +42,7 @@ declare -A PHASE_MODEL=(
     [finalize-review]="$OPUS"
 )
 
-# Phase → allowed tools
+# Phase → allowed built-in tools (MCP/plugin tools are unrestricted via --tools)
 declare -A PHASE_TOOLS=(
     [specify]="Skill,Read,Write,Edit,Bash,Glob,Grep,TodoWrite"
     [clarify]="Skill,Read,Write,Edit,Bash,Glob,Grep"
@@ -137,7 +137,7 @@ invoke_claude() {
     local exit_code=0
     claude -p "$prompt" \
         --model "$model" \
-        --allowedTools "$tools" \
+        --tools "$tools" \
         --output-format stream-json \
         --verbose \
         --dangerously-skip-permissions \

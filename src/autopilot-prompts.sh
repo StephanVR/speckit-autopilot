@@ -242,6 +242,13 @@ in each subagent prompt:
   "Before writing code, read .specify/memory/architecture.md for module
   dependencies and CLAUDE.md for reusable utilities and patterns."
 
+MCP tools available in this phase:
+- Svelte: use mcp__svelte__* and mcp__plugin_svelte_svelte__* tools for docs lookup and code validation
+- Pencil: use mcp__pencil__* tools for reading/writing .pen design files
+- Playwright: use mcp__plugin_playwright_playwright__* tools for browser testing
+Use the svelte-autofixer on every .svelte file you create or edit.
+Use Pencil tools when working with .pen design files (never use Read/Grep on .pen files).
+
 Then invoke the Skill tool:
   skill = "speckit.implement"
   args  = "all tasks using subagents for parallel [P] tasks"
