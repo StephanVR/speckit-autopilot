@@ -51,7 +51,7 @@ SRC_DIR=""
 CLEANUP_DIR=""
 
 # Check if running from a local clone (install.sh is in the repo root with src/)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd || echo "")"
 if [[ -d "$SCRIPT_DIR/src" ]] && [[ -f "$SCRIPT_DIR/VERSION" ]]; then
     SRC_DIR="$SCRIPT_DIR"
     info "Installing from local clone: $SRC_DIR"
